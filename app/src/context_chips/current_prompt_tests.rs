@@ -1180,3 +1180,63 @@ impl CommandExecutor for RecordingCommandExecutor {
         false
     }
 }
+
+#[test]
+fn test_kubernetes_chip_fingerprint_follows_kubeconfig_env() {
+    App::test((), |mut app| async move {
+        app.add_singleton_model(|_| {
+            Prompt::mock_with(
+                [ContextChipKind::KubernetesContext],
+                false,
+                WarpPromptSeparator::None,
+            )
+        });
+        app.add_singleton_model(SessionSettings::new_with_defaults);
+        app.add_singleton_model(|_ctx| {
+            settings::PublicPreferences::new(
+                Box::<user_preferences::in_memory::InMemoryPreferences>::default(),
+            )
+        });
+        app.add_singleton_model(|_| {
+            settings::PrivatePreferences::new(
+                Box::<user_preferences::in_memory::InMemoryPreferences>::default(),
+            )
+        });
+
+        let sessions = app.add_model(|_| Sessions::new_for_test());
+        let current_prompt = app.add_model(move |ctx| CurrentPrompt::new(sessions, ctx));
+
+        current_prompt.update(&mut app, |current_prompt, ctx| {
+            current_prompt.latest_context = Some(PromptContext {
+                active_block_metadata: BlockMetadata::new(Some(SessionId::from(321)), None),
+                environment: Environment::default(),
+            });
+            let kind = ContextChipKind::KubernetesContext;
+            let chip = kind.to_chip().expect("kubernetes chip");
+            let fingerprint = |kubeconfig: Option<&str>| {
+                current_prompt
+                    .with_current_generator_context(ctx, |generator_context| {
+                        current_prompt.build_chip_fingerprint(
+                            &kind,
+                            &chip,
+                            &[],
+                            generator_context,
+                            &Default::default(),
+                            kubeconfig,
+                        )
+                    })
+                    .flatten()
+            };
+
+            assert_eq!(
+                fingerprint(Some("/a/config")),
+                fingerprint(Some("/a/config"))
+            );
+            assert_ne!(
+                fingerprint(Some("/a/config")),
+                fingerprint(Some("/b/config"))
+            );
+            assert_ne!(fingerprint(Some("/a/config")), fingerprint(None));
+        });
+    });
+}

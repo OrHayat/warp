@@ -209,6 +209,8 @@ pub enum ChipFingerprintInput {
     PythonVirtualenv,
     CondaEnvironment,
     NodeVersion,
+    /// The session's `KUBECONFIG`, which Warp receives from the shell on every prompt.
+    KubeconfigEnv,
     SessionUser,
     SessionHostname,
     ExternalCommandsState,

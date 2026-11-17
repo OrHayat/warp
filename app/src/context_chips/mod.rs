@@ -370,6 +370,7 @@ impl ContextChipKind {
                     None,
                     [
                         ChipFingerprintInput::SessionId,
+                        ChipFingerprintInput::KubeconfigEnv,
                         ChipFingerprintInput::InvalidatingCommandCount,
                     ],
                 )

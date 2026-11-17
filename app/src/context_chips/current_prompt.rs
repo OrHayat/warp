@@ -477,6 +477,7 @@ impl CurrentPrompt {
         required_executables: &[String],
         context: &GeneratorContext,
         capabilities: &ChipRuntimeCapabilities,
+        kubeconfig_env: Option<&str>,
     ) -> Option<ChipFingerprint> {
         let inputs = chip.runtime_policy().fingerprint_inputs();
         if inputs.is_empty() {
@@ -516,6 +517,9 @@ impl CurrentPrompt {
                         .current_environment
                         .conda_environment()
                         .hash(&mut hasher);
+                }
+                ChipFingerprintInput::KubeconfigEnv => {
+                    kubeconfig_env.hash(&mut hasher);
                 }
                 ChipFingerprintInput::NodeVersion => {
                     context.current_environment.node_version().hash(&mut hasher);
@@ -716,6 +720,12 @@ impl CurrentPrompt {
             .runtime_policy()
             .fingerprint_inputs()
             .contains(&ChipFingerprintInput::ExternalCommandsState);
+        let kubeconfig_env = chip
+            .runtime_policy()
+            .fingerprint_inputs()
+            .contains(&ChipFingerprintInput::KubeconfigEnv)
+            .then(|| self.session_env_var("KUBECONFIG", ctx))
+            .flatten();
         let (availability, fingerprint) = self
             .with_current_generator_context(ctx, |generator_context| {
                 let capabilities = self.chip_runtime_capabilities_for_session(
@@ -731,6 +741,7 @@ impl CurrentPrompt {
                         required_executables,
                         generator_context,
                         &capabilities,
+                        kubeconfig_env.as_deref(),
                     ),
                 )
             })
@@ -1715,13 +1726,9 @@ impl CurrentPrompt {
             .as_ref()?
             .active_block_metadata
             .session_id()?;
-        let (session, env_vars) = self.sessions.read(ctx, |sessions, _| {
-            (
-                sessions.get(session_id),
-                sessions.get_env_vars_for_session(session_id),
-            )
-        });
-        let session = session?;
+        let session = self
+            .sessions
+            .read(ctx, |sessions, _| sessions.get(session_id))?;
         if !session.is_local()
             || crate::terminal::model::session::get_local_hostname().ok()? != session.hostname()
         {
@@ -1731,12 +1738,21 @@ impl CurrentPrompt {
         if std::path::Path::new(session.home_dir()?) != home {
             return None;
         }
-        let kubeconfig_env = env_vars
-            .as_ref()
-            .and_then(|vars| vars.get("KUBECONFIG"))
-            .map(String::as_str);
-        let key = kubeconfig_files(kubeconfig_env, &home)?;
+        let kubeconfig_env = self.session_env_var("KUBECONFIG", ctx);
+        let key = kubeconfig_files(kubeconfig_env.as_deref(), &home)?;
         Some((key, session.path().clone()))
+    }
+
+    /// An environment variable the active session's shell reported with its last prompt.
+    fn session_env_var(&self, name: &str, ctx: &AppContext) -> Option<String> {
+        let session_id = self
+            .latest_context
+            .as_ref()?
+            .active_block_metadata
+            .session_id()?;
+        self.sessions.read(ctx, |sessions, _| {
+            sessions.get_env_vars_for_session(session_id)?.remove(name)
+        })
     }
 
     #[cfg(feature = "local_fs")]
