@@ -2134,6 +2134,8 @@ pub(crate) fn initialize_app(
     }
 
     ctx.add_singleton_model(|_| GitRepoModels::new());
+    #[cfg(feature = "local_fs")]
+    ctx.add_singleton_model(context_chips::kube_context::KubeContextModel::new);
 
     ctx.add_singleton_model(|ctx| {
         ProjectManagementModel::new(persisted_projects, persistence_writer.sender(), ctx)

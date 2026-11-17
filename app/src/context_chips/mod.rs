@@ -7,6 +7,8 @@ pub mod display;
 pub mod display_chip;
 pub mod display_menu;
 pub(crate) mod git_branch_on_click;
+#[cfg(feature = "local_fs")]
+pub mod kube_context;
 pub(crate) mod logging;
 pub mod node_version_popup;
 pub mod prompt;
@@ -119,6 +121,31 @@ fn parse_github_pr_number(number: &str) -> Option<i32> {
 pub(crate) fn github_pr_display_text_from_url(url: &str) -> Option<String> {
     github_pr_number_from_url(url).map(|number| format!("PR #{number}"))
 }
+
+/// Commands that use the kubeconfig: they decide when the Kubernetes chip shows, and in
+/// sessions without a local kubeconfig watch, finishing one refreshes the chip.
+const KUBERNETES_COMMANDS: [&str; 20] = [
+    "kubectl",
+    "helm",
+    "kubens",
+    "kubectx",
+    "oc",
+    "istioctl",
+    "kogito",
+    "k9s",
+    "helmfile",
+    "flux",
+    "fluxctl",
+    "stern",
+    "kubeseal",
+    "skaffold",
+    "kubent",
+    "kubecolor",
+    "cmctl",
+    "sparkctl",
+    "etcd",
+    "fubectl",
+];
 
 /// The refresh settings for the date context chip.
 /// unless the clock strikes midnight without the user running a command.
@@ -333,12 +360,29 @@ impl ContextChipKind {
                 |_| None,
                 RefreshConfig::OnDemandOnly,
             )),
-            Self::KubernetesContext => Some(ContextChip::shell_builtin(
-                "Kubernetes Context",
-                builtins::kubernetes_current_context(),
-                None,
-                RefreshConfig::OnDemandOnly,
-            )),
+            Self::KubernetesContext => {
+                // Local sessions get this value from `kube_context::KubeContextModel`; this
+                // generator only runs where that cannot watch the kubeconfig (e.g. over SSH).
+                let generator = builtins::kubernetes_current_context();
+                let runtime_policy = ChipRuntimePolicy::new(
+                    generator.dependencies().to_vec(),
+                    false,
+                    None,
+                    [
+                        ChipFingerprintInput::SessionId,
+                        ChipFingerprintInput::InvalidatingCommandCount,
+                    ],
+                )
+                .with_suppress_on_failure()
+                .with_invalidate_on_commands(KUBERNETES_COMMANDS);
+                Some(ContextChip::shell_builtin_with_runtime_policy(
+                    "Kubernetes Context",
+                    generator,
+                    None,
+                    RefreshConfig::OnDemandOnly,
+                    runtime_policy,
+                ))
+            }
             Self::SvnBranch => Some(ContextChip::shell_builtin(
                 "Svn Branch",
                 builtins::svn_branch_context(),
@@ -496,29 +540,6 @@ impl ContextChipKind {
     pub fn should_render(&self, command: &str, aliases: &HashMap<SmolStr, String>) -> bool {
         match self {
             Self::KubernetesContext => {
-                const KUBERNETES_COMMANDS: [&str; 20] = [
-                    "kubectl",
-                    "helm",
-                    "kubens",
-                    "kubectx",
-                    "oc",
-                    "istioctl",
-                    "kogito",
-                    "k9s",
-                    "helmfile",
-                    "flux",
-                    "fluxctl",
-                    "stern",
-                    "kubeseal",
-                    "skaffold",
-                    "kubent",
-                    "kubecolor",
-                    "cmctl",
-                    "sparkctl",
-                    "etcd",
-                    "fubectl",
-                ];
-
                 command.split_whitespace().next().is_some_and(|first_word| {
                     KUBERNETES_COMMANDS.contains(&first_word)
                         || aliases.get(first_word).is_some_and(|expanded| {

@@ -29,6 +29,10 @@ use crate::ai::blocklist::agent_view::AgentViewController;
 use crate::code_review::git_repo_model::{GitRepoStatusEvent, GitRepoStatusModel};
 use crate::code_review::github_repo_model::{GitHubRepoEvent, GitHubRepoModel};
 use crate::context_chips::display_chip::GitLineChanges;
+#[cfg(feature = "local_fs")]
+use crate::context_chips::kube_context::{
+    KubeContextEvent, KubeContextModel, KubeconfigKey, kubeconfig_files,
+};
 use crate::editor::EditorView;
 use crate::features::FeatureFlag;
 use crate::menu::{MenuItem, MenuItemFields};
@@ -171,6 +175,11 @@ pub struct CurrentPrompt {
     /// `GitHubRepoModel` for the current repository.
     github_repo_model: Option<WeakModelHandle<GitHubRepoModel>>,
 
+    /// The kubeconfig whose shared value the Kubernetes chip shows, while the active session is
+    /// local; `None` means the chip runs its shell generator instead.
+    #[cfg(feature = "local_fs")]
+    kube_key: Option<KubeconfigKey>,
+
     /// Used to resolve lazily-computed `UserBlockCompleted` fields in `handle_model_event`.
     /// Only set (together with the `handle_model_event` subscription) when constructed via
     /// `new_with_model_events` with a live terminal session. See that constructor's `live_session`
@@ -236,6 +245,16 @@ impl CurrentPrompt {
             }
         });
 
+        #[cfg(feature = "local_fs")]
+        if ctx.has_singleton_model::<KubeContextModel>() {
+            ctx.subscribe_to_model(&KubeContextModel::handle(ctx), |me, _, event, ctx| {
+                let KubeContextEvent::Changed(key) = event;
+                if me.kube_key.as_ref() == Some(key) {
+                    me.apply_kube_context(ctx);
+                }
+            });
+        }
+
         if let Some((model_events, _)) = &live_session {
             ctx.subscribe_to_model(model_events, Self::handle_model_event);
         }
@@ -273,6 +292,8 @@ impl CurrentPrompt {
             separator: prompt.as_ref(ctx).separator(),
             git_repo_status: None,
             github_repo_model: None,
+            #[cfg(feature = "local_fs")]
+            kube_key: None,
             terminal_model,
         }
     }
@@ -1035,6 +1056,12 @@ impl CurrentPrompt {
                 let state = ChipState::new(chip_kind);
                 self.states.insert(chip_kind.clone(), state);
             }
+            #[cfg(feature = "local_fs")]
+            if matches!(chip_kind, ContextChipKind::KubernetesContext)
+                && self.sync_local_kube_context(ctx)
+            {
+                return;
+            }
             if self.is_updated_externally(chip_kind) {
                 // For chips updated externally (e.g. by the per-repo git status
                 // filesystem watcher), avoid running the shell-based fallback
@@ -1655,6 +1682,74 @@ impl CurrentPrompt {
         if current_pr != new_pr_value {
             self.update_chip_value(&ContextChipKind::GithubPullRequest, new_pr_value);
         }
+    }
+
+    /// Points the Kubernetes chip at the shared value for the active session's kubeconfig.
+    /// Returns `false` when the session is not one whose kubeconfig this machine can watch.
+    #[cfg(feature = "local_fs")]
+    fn sync_local_kube_context(&mut self, ctx: &mut ModelContext<Self>) -> bool {
+        let Some((key, path_env)) = self.local_kubeconfig(ctx) else {
+            self.kube_key = None;
+            return false;
+        };
+        KubeContextModel::handle(ctx).update(ctx, |model, ctx| model.ensure(&key, path_env, ctx));
+        self.kube_key = Some(key);
+        self.set_chip_availability(
+            &ContextChipKind::KubernetesContext,
+            ChipAvailability::Enabled,
+        );
+        self.apply_kube_context(ctx);
+        true
+    }
+
+    /// The active session's kubeconfig files and `PATH`, when the session runs on this machine
+    /// as this user. A same-hostname session with another home (e.g. a host-network
+    /// container) reads a different kubeconfig, so it keeps the shell generator.
+    #[cfg(feature = "local_fs")]
+    fn local_kubeconfig(&self, ctx: &AppContext) -> Option<(KubeconfigKey, Option<String>)> {
+        if !ctx.has_singleton_model::<KubeContextModel>() {
+            return None;
+        }
+        let session_id = self
+            .latest_context
+            .as_ref()?
+            .active_block_metadata
+            .session_id()?;
+        let (session, env_vars) = self.sessions.read(ctx, |sessions, _| {
+            (
+                sessions.get(session_id),
+                sessions.get_env_vars_for_session(session_id),
+            )
+        });
+        let session = session?;
+        if !session.is_local()
+            || crate::terminal::model::session::get_local_hostname().ok()? != session.hostname()
+        {
+            return None;
+        }
+        let home = dirs::home_dir()?;
+        if std::path::Path::new(session.home_dir()?) != home {
+            return None;
+        }
+        let kubeconfig_env = env_vars
+            .as_ref()
+            .and_then(|vars| vars.get("KUBECONFIG"))
+            .map(String::as_str);
+        let key = kubeconfig_files(kubeconfig_env, &home)?;
+        Some((key, session.path().clone()))
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn apply_kube_context(&mut self, ctx: &AppContext) {
+        let Some(key) = &self.kube_key else {
+            return;
+        };
+        // Unknown until the first fetch lands; `KubeContextEvent::Changed` applies it then.
+        let Some(context) = KubeContextModel::as_ref(ctx).current_context(key) else {
+            return;
+        };
+        let value = context.map(|context| ChipValue::Text(context.to_owned()));
+        self.update_chip_value(&ContextChipKind::KubernetesContext, value);
     }
 
     /// Returns `true` when the given chip's value is updated externally
