@@ -1322,7 +1322,7 @@ fn test_local_kubernetes_chip_without_kubectl_launches_nothing() {
                     command: "kubectl".to_string(),
                 })
             );
-            assert!(current_prompt.kube_key.is_none());
+            assert!(current_prompt.kube_model.is_none());
             // The session qualifies for the shared value, so this exercised the local path.
             assert!(current_prompt.local_kubeconfig(ctx).is_some());
         });

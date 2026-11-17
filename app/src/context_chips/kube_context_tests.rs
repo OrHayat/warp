@@ -1,8 +1,9 @@
 use std::path::{Path, PathBuf};
 
+use warpui::{App, SingletonEntity};
 use watcher::BulkFilesystemWatcherEvent;
 
-use super::{affected_keys, kubeconfig_files, watch_paths};
+use super::{KubeContextModel, kubeconfig_files, touches, watch_paths};
 
 #[test]
 fn test_kubeconfig_files_defaults_to_home_kube_config() {
@@ -31,36 +32,54 @@ fn test_kubeconfig_files_rejects_relative_entries() {
 }
 
 #[test]
-fn test_affected_keys_matches_written_and_renamed_files() {
-    let default_key = vec![PathBuf::from("/home/user/.kube/config")];
-    let other_key = vec![PathBuf::from("/srv/kube/prod.yaml")];
-    let keys = [
-        (&default_key, default_key.as_slice()),
-        (&other_key, other_key.as_slice()),
-    ];
+fn test_touches_matches_written_and_renamed_files() {
+    let paths = [PathBuf::from("/home/user/.kube/config")];
 
     let modified = BulkFilesystemWatcherEvent {
         modified: [PathBuf::from("/home/user/.kube/config")].into(),
         ..Default::default()
     };
-    assert_eq!(affected_keys(keys, &modified), vec![default_key.clone()]);
+    assert!(touches(&paths, &modified));
 
     // kubectl writes a temp file and renames it over the kubeconfig.
     let renamed = BulkFilesystemWatcherEvent {
         moved: [(
-            PathBuf::from("/srv/kube/prod.yaml"),
-            PathBuf::from("/srv/kube/prod.yaml.lock"),
+            PathBuf::from("/home/user/.kube/config"),
+            PathBuf::from("/home/user/.kube/config.lock"),
         )]
         .into(),
         ..Default::default()
     };
-    assert_eq!(affected_keys(keys, &renamed), vec![other_key.clone()]);
+    assert!(touches(&paths, &renamed));
 
     let unrelated = BulkFilesystemWatcherEvent {
         added: [PathBuf::from("/home/user/.kube/cache")].into(),
         ..Default::default()
     };
-    assert!(affected_keys(keys, &unrelated).is_empty());
+    assert!(!touches(&paths, &unrelated));
+}
+
+#[test]
+fn test_kubeconfig_model_is_shared_while_held_and_dropped_after() {
+    App::test((), |mut app| async move {
+        app.add_singleton_model(KubeContextModel::new_for_test);
+        // A path kubectl cannot read, so the model's one fetch finds no context.
+        let key = vec![PathBuf::from("/nonexistent-kube-test/config")];
+        let subscribe = |app: &mut App| {
+            KubeContextModel::handle(app).update(app, |models, ctx| {
+                models.subscribe(&key, Some(String::new()), ctx)
+            })
+        };
+
+        let first = subscribe(&mut app);
+        let second = subscribe(&mut app);
+        assert_eq!(first.id(), second.id());
+
+        let weak = first.downgrade();
+        drop(first);
+        drop(second);
+        assert!(app.read(|ctx| weak.upgrade(ctx)).is_none());
+    });
 }
 
 #[cfg(unix)]
@@ -80,8 +99,5 @@ fn test_symlinked_kubeconfig_is_affected_by_edits_to_its_target() {
         modified: [target.canonicalize().unwrap()].into(),
         ..Default::default()
     };
-    assert_eq!(
-        affected_keys([(&key, paths.as_slice())], &edited_target),
-        vec![key.clone()]
-    );
+    assert!(touches(&paths, &edited_target));
 }

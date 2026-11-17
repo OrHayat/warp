@@ -1,8 +1,8 @@
-//! App-wide `kubectl config current-context` values for local sessions.
+//! Shared `kubectl config current-context` values for local sessions.
 //!
 //! The Kubernetes chip's value only changes when a kubeconfig file changes, so local sessions
-//! share one cached value per kubeconfig file list and refresh it from a filesystem watch
-//! instead of running `kubectl` on every prompt.
+//! share one value per kubeconfig file list, refreshed from a filesystem watch instead of
+//! running `kubectl` on every prompt.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use notify_debouncer_full::notify::{RecursiveMode, WatchFilter};
 use warpui::r#async::SpawnedFutureHandle;
-use warpui::{Entity, ModelContext, ModelHandle, SingletonEntity};
+use warpui::{Entity, ModelContext, ModelHandle, SingletonEntity, WeakModelHandle};
 use watcher::{BulkFilesystemWatcher, BulkFilesystemWatcherEvent};
 
 const KUBECONFIG_WATCHER_DEBOUNCE: Duration = Duration::from_millis(300);
@@ -48,112 +48,137 @@ pub fn watch_paths(key: &KubeconfigKey) -> Vec<PathBuf> {
     paths
 }
 
-/// Returns the keys with a watch path the event touched.
-pub fn affected_keys<'a>(
-    entries: impl IntoIterator<Item = (&'a KubeconfigKey, &'a [PathBuf])>,
-    event: &BulkFilesystemWatcherEvent,
-) -> Vec<KubeconfigKey> {
-    let touched: HashSet<&PathBuf> = event
+/// Whether the event touched any of `paths`.
+pub fn touches(paths: &[PathBuf], event: &BulkFilesystemWatcherEvent) -> bool {
+    event
         .added
         .iter()
         .chain(&event.modified)
         .chain(&event.deleted)
         .chain(event.moved.keys())
         .chain(event.moved.values())
-        .collect();
-    entries
-        .into_iter()
-        .filter(|(_, paths)| paths.iter().any(|path| touched.contains(path)))
-        .map(|(key, _)| key.clone())
-        .collect()
+        .any(|touched| paths.contains(touched))
 }
 
-pub enum KubeContextEvent {
-    /// The current context for this kubeconfig was fetched or changed.
-    Changed(KubeconfigKey),
-}
-
-struct Entry {
-    /// `None` until the first fetch finishes; `Some(None)` when there is no current context.
-    context: Option<Option<String>>,
-    /// `PATH` used to find `kubectl`, from the session that registered the key.
-    path_env: Option<String>,
-    /// From [`watch_paths`]; recomputed on each change, since a symlink may be retargeted.
-    watch_paths: Vec<PathBuf>,
-    fetch: Option<SpawnedFutureHandle>,
-}
-
+/// Hands out one [`KubeconfigModel`] per kubeconfig. Callers hold the returned handle while
+/// they show its context; the model, its `kubectl` run and its watch go away with the last one.
 pub struct KubeContextModel {
-    entries: HashMap<KubeconfigKey, Entry>,
-    watched_dirs: HashSet<PathBuf>,
-    /// Kubeconfig directories that did not exist yet; an existing ancestor is watched instead.
-    pending_dirs: HashSet<PathBuf>,
-    watcher: ModelHandle<BulkFilesystemWatcher>,
+    models: HashMap<KubeconfigKey, WeakModelHandle<KubeconfigModel>>,
+    test_watchers: bool,
 }
 
 impl KubeContextModel {
-    pub fn new(ctx: &mut ModelContext<Self>) -> Self {
-        let watcher =
-            ctx.add_model(|ctx| BulkFilesystemWatcher::new(KUBECONFIG_WATCHER_DEBOUNCE, ctx));
-        Self::with_watcher(watcher, ctx)
-    }
-
-    pub fn new_for_test(ctx: &mut ModelContext<Self>) -> Self {
-        let watcher = ctx.add_model(|_| BulkFilesystemWatcher::new_for_test());
-        Self::with_watcher(watcher, ctx)
-    }
-
-    fn with_watcher(
-        watcher: ModelHandle<BulkFilesystemWatcher>,
-        ctx: &mut ModelContext<Self>,
-    ) -> Self {
-        ctx.subscribe_to_model(&watcher, Self::handle_fs_event);
+    pub fn new(_: &mut ModelContext<Self>) -> Self {
         Self {
-            entries: HashMap::new(),
-            watched_dirs: HashSet::new(),
-            pending_dirs: HashSet::new(),
-            watcher,
+            models: HashMap::new(),
+            test_watchers: false,
         }
     }
 
-    /// The cached current context: `None` while unknown, `Some(None)` when there is none.
-    pub fn current_context(&self, key: &KubeconfigKey) -> Option<Option<&str>> {
-        let context = self.entries.get(key)?.context.as_ref()?;
-        Some(context.as_deref())
+    /// Hands out models whose filesystem watchers have no background thread.
+    pub fn new_for_test(_: &mut ModelContext<Self>) -> Self {
+        Self {
+            models: HashMap::new(),
+            test_watchers: true,
+        }
     }
 
-    /// Starts tracking `key`: watches its directories and fetches it once. A fetch that could
-    /// not run (timeout, missing `kubectl`) is retried on the next call.
-    pub fn ensure(
+    pub fn subscribe(
         &mut self,
         key: &KubeconfigKey,
         path_env: Option<String>,
         ctx: &mut ModelContext<Self>,
-    ) {
-        if let Some(entry) = self.entries.get_mut(key) {
-            if entry.context.is_none() && entry.fetch.is_none() {
-                entry.path_env = path_env.or(entry.path_env.take());
-                self.fetch(key.clone(), ctx);
-            }
-            return;
+    ) -> ModelHandle<KubeconfigModel> {
+        if let Some(model) = self.models.get(key).and_then(|weak| weak.upgrade(ctx)) {
+            return model;
         }
-        let paths = watch_paths(key);
-        self.watch(&paths, ctx);
-        self.entries.insert(
-            key.clone(),
-            Entry {
-                context: None,
-                path_env,
-                fetch: None,
-                watch_paths: paths,
-            },
-        );
-        self.fetch(key.clone(), ctx);
+        self.models.retain(|_, weak| weak.upgrade(ctx).is_some());
+        let key = key.clone();
+        let test_watchers = self.test_watchers;
+        let model =
+            ctx.add_model(|ctx| KubeconfigModel::new(key.clone(), path_env, test_watchers, ctx));
+        self.models.insert(key, model.downgrade());
+        model
+    }
+}
+
+impl Entity for KubeContextModel {
+    type Event = ();
+}
+
+impl SingletonEntity for KubeContextModel {}
+
+pub enum KubeconfigEvent {
+    /// The current context was fetched or changed.
+    Changed,
+}
+
+/// The current context of one kubeconfig, refreshed when its files change.
+pub struct KubeconfigModel {
+    key: KubeconfigKey,
+    /// `None` until a fetch succeeds; `Some(None)` when there is no current context.
+    context: Option<Option<String>>,
+    /// `PATH` used to find `kubectl`.
+    path_env: Option<String>,
+    /// From [`watch_paths`]; recomputed on each change, since a symlink may be retargeted.
+    watch_paths: Vec<PathBuf>,
+    watched_dirs: HashSet<PathBuf>,
+    /// Kubeconfig directories that did not exist yet; an existing ancestor is watched instead.
+    pending_dirs: HashSet<PathBuf>,
+    watcher: ModelHandle<BulkFilesystemWatcher>,
+    fetch: Option<SpawnedFutureHandle>,
+}
+
+impl KubeconfigModel {
+    fn new(
+        key: KubeconfigKey,
+        path_env: Option<String>,
+        test_watcher: bool,
+        ctx: &mut ModelContext<Self>,
+    ) -> Self {
+        let watcher = ctx.add_model(|ctx| {
+            if test_watcher {
+                BulkFilesystemWatcher::new_for_test()
+            } else {
+                BulkFilesystemWatcher::new(KUBECONFIG_WATCHER_DEBOUNCE, ctx)
+            }
+        });
+        ctx.subscribe_to_model(&watcher, Self::handle_fs_event);
+        let mut model = Self {
+            watch_paths: watch_paths(&key),
+            key,
+            context: None,
+            path_env,
+            watched_dirs: HashSet::new(),
+            pending_dirs: HashSet::new(),
+            watcher,
+            fetch: None,
+        };
+        model.watch(ctx);
+        model.fetch(ctx);
+        model
+    }
+
+    pub fn key(&self) -> &KubeconfigKey {
+        &self.key
+    }
+
+    /// The cached current context: `None` while unknown, `Some(None)` when there is none.
+    pub fn current_context(&self) -> Option<Option<&str>> {
+        Some(self.context.as_ref()?.as_deref())
+    }
+
+    /// Retries a fetch that could not run (timeout, `kubectl` not found on `PATH`).
+    pub fn retry_if_unknown(&mut self, path_env: Option<String>, ctx: &mut ModelContext<Self>) {
+        if self.context.is_none() && self.fetch.is_none() {
+            self.path_env = path_env.or(self.path_env.take());
+            self.fetch(ctx);
+        }
     }
 
     /// Watches the directory of each path, not the file: kubectl replaces the file by renaming.
-    fn watch(&mut self, paths: &[PathBuf], ctx: &mut ModelContext<Self>) {
-        for dir in paths.iter().filter_map(|path| path.parent()) {
+    fn watch(&mut self, ctx: &mut ModelContext<Self>) {
+        for dir in self.watch_paths.iter().filter_map(|path| path.parent()) {
             let target = if dir.is_dir() {
                 dir
             } else {
@@ -175,28 +200,22 @@ impl KubeContextModel {
         }
     }
 
-    fn fetch(&mut self, key: KubeconfigKey, ctx: &mut ModelContext<Self>) {
-        let Some(entry) = self.entries.get_mut(&key) else {
-            return;
-        };
-        if let Some(handle) = entry.fetch.take() {
+    fn fetch(&mut self, ctx: &mut ModelContext<Self>) {
+        if let Some(handle) = self.fetch.take() {
             handle.abort();
         }
-        let files = key.clone();
-        let path_env = entry.path_env.clone();
-        entry.fetch = Some(ctx.spawn(
+        let files = self.key.clone();
+        let path_env = self.path_env.clone();
+        self.fetch = Some(ctx.spawn(
             async move { run_kubectl_current_context(files, path_env).await },
-            move |me, result, ctx| {
-                let Some(entry) = me.entries.get_mut(&key) else {
-                    return;
-                };
-                entry.fetch = None;
+            |me, result, ctx| {
+                me.fetch = None;
                 let Ok(context) = result else {
                     return;
                 };
-                if entry.context.as_ref() != Some(&context) {
-                    entry.context = Some(context);
-                    ctx.emit(KubeContextEvent::Changed(key));
+                if me.context.as_ref() != Some(&context) {
+                    me.context = Some(context);
+                    ctx.emit(KubeconfigEvent::Changed);
                 }
             },
         ));
@@ -208,43 +227,25 @@ impl KubeContextModel {
         event: &BulkFilesystemWatcherEvent,
         ctx: &mut ModelContext<Self>,
     ) {
-        let mut changed: HashSet<KubeconfigKey> = affected_keys(
-            self.entries
-                .iter()
-                .map(|(key, entry)| (key, entry.watch_paths.as_slice())),
-            event,
-        )
-        .into_iter()
-        .collect();
-
-        let created: Vec<PathBuf> = self
-            .pending_dirs
-            .iter()
-            .filter(|dir| dir.is_dir())
-            .cloned()
-            .collect();
-        for dir in &created {
-            self.pending_dirs.remove(dir);
+        let created_dir = self.pending_dirs.iter().any(|dir| dir.is_dir());
+        self.pending_dirs.retain(|dir| !dir.is_dir());
+        if !created_dir && !touches(&self.watch_paths, event) {
+            return;
         }
-        changed.extend(
-            self.entries
-                .iter()
-                .filter(|(_, entry)| {
-                    entry
-                        .watch_paths
-                        .iter()
-                        .any(|path| created.iter().any(|dir| path.starts_with(dir)))
-                })
-                .map(|(key, _)| key.clone()),
-        );
+        self.watch_paths = watch_paths(&self.key);
+        self.watch(ctx);
+        self.fetch(ctx);
+    }
+}
 
-        for key in changed {
-            let paths = watch_paths(&key);
-            self.watch(&paths, ctx);
-            if let Some(entry) = self.entries.get_mut(&key) {
-                entry.watch_paths = paths;
-            }
-            self.fetch(key, ctx);
+impl Entity for KubeconfigModel {
+    type Event = KubeconfigEvent;
+}
+
+impl Drop for KubeconfigModel {
+    fn drop(&mut self) {
+        if let Some(handle) = self.fetch.take() {
+            handle.abort();
         }
     }
 }
@@ -275,11 +276,11 @@ async fn run_kubectl_current_context(
     let output = match futures::future::select(output, timeout).await {
         futures::future::Either::Left((Ok(output), _)) => output,
         futures::future::Either::Left((Err(err), _)) => {
-            log::debug!("KubeContextModel: failed to run kubectl: {err}");
+            log::debug!("KubeconfigModel: failed to run kubectl: {err}");
             return Err(());
         }
         futures::future::Either::Right(_) => {
-            log::debug!("KubeContextModel: kubectl timed out");
+            log::debug!("KubeconfigModel: kubectl timed out");
             return Err(());
         }
     };
@@ -289,12 +290,6 @@ async fn run_kubectl_current_context(
     let context = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     Ok((!context.is_empty()).then_some(context))
 }
-
-impl Entity for KubeContextModel {
-    type Event = KubeContextEvent;
-}
-
-impl SingletonEntity for KubeContextModel {}
 
 #[cfg(test)]
 #[path = "kube_context_tests.rs"]
