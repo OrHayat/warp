@@ -35,9 +35,22 @@ pub fn kubeconfig_files(kubeconfig_env: Option<&str>, home: &Path) -> Option<Kub
     Some(files)
 }
 
-/// Returns the keys that read any file the event touched.
+/// The paths whose changes affect `key`: each file, plus its target when it is a symlink.
+pub fn watch_paths(key: &KubeconfigKey) -> Vec<PathBuf> {
+    let mut paths = key.clone();
+    for file in key {
+        if let Ok(target) = std::fs::canonicalize(file)
+            && !paths.contains(&target)
+        {
+            paths.push(target);
+        }
+    }
+    paths
+}
+
+/// Returns the keys with a watch path the event touched.
 pub fn affected_keys<'a>(
-    keys: impl IntoIterator<Item = &'a KubeconfigKey>,
+    entries: impl IntoIterator<Item = (&'a KubeconfigKey, &'a [PathBuf])>,
     event: &BulkFilesystemWatcherEvent,
 ) -> Vec<KubeconfigKey> {
     let touched: HashSet<&PathBuf> = event
@@ -48,9 +61,10 @@ pub fn affected_keys<'a>(
         .chain(event.moved.keys())
         .chain(event.moved.values())
         .collect();
-    keys.into_iter()
-        .filter(|key| key.iter().any(|file| touched.contains(file)))
-        .cloned()
+    entries
+        .into_iter()
+        .filter(|(_, paths)| paths.iter().any(|path| touched.contains(path)))
+        .map(|(key, _)| key.clone())
         .collect()
 }
 
@@ -64,12 +78,16 @@ struct Entry {
     context: Option<Option<String>>,
     /// `PATH` used to find `kubectl`, from the session that registered the key.
     path_env: Option<String>,
+    /// From [`watch_paths`]; recomputed on each change, since a symlink may be retargeted.
+    watch_paths: Vec<PathBuf>,
     fetch: Option<SpawnedFutureHandle>,
 }
 
 pub struct KubeContextModel {
     entries: HashMap<KubeconfigKey, Entry>,
     watched_dirs: HashSet<PathBuf>,
+    /// Kubeconfig directories that did not exist yet; an existing ancestor is watched instead.
+    pending_dirs: HashSet<PathBuf>,
     watcher: ModelHandle<BulkFilesystemWatcher>,
 }
 
@@ -93,6 +111,7 @@ impl KubeContextModel {
         Self {
             entries: HashMap::new(),
             watched_dirs: HashSet::new(),
+            pending_dirs: HashSet::new(),
             watcher,
         }
     }
@@ -118,27 +137,42 @@ impl KubeContextModel {
             }
             return;
         }
-        for dir in key.iter().filter_map(|file| file.parent()) {
-            if self.watched_dirs.insert(dir.to_path_buf()) {
-                self.watcher.update(ctx, |watcher, _| {
-                    // The directory, not the file: kubectl replaces the file by renaming.
-                    std::mem::drop(watcher.register_path(
-                        dir,
-                        WatchFilter::accept_all(),
-                        RecursiveMode::NonRecursive,
-                    ));
-                });
-            }
-        }
+        let paths = watch_paths(key);
+        self.watch(&paths, ctx);
         self.entries.insert(
             key.clone(),
             Entry {
                 context: None,
                 path_env,
                 fetch: None,
+                watch_paths: paths,
             },
         );
         self.fetch(key.clone(), ctx);
+    }
+
+    /// Watches the directory of each path, not the file: kubectl replaces the file by renaming.
+    fn watch(&mut self, paths: &[PathBuf], ctx: &mut ModelContext<Self>) {
+        for dir in paths.iter().filter_map(|path| path.parent()) {
+            let target = if dir.is_dir() {
+                dir
+            } else {
+                self.pending_dirs.insert(dir.to_path_buf());
+                match dir.ancestors().skip(1).find(|ancestor| ancestor.is_dir()) {
+                    Some(ancestor) => ancestor,
+                    None => continue,
+                }
+            };
+            if self.watched_dirs.insert(target.to_path_buf()) {
+                self.watcher.update(ctx, |watcher, _| {
+                    std::mem::drop(watcher.register_path(
+                        target,
+                        WatchFilter::accept_all(),
+                        RecursiveMode::NonRecursive,
+                    ));
+                });
+            }
+        }
     }
 
     fn fetch(&mut self, key: KubeconfigKey, ctx: &mut ModelContext<Self>) {
@@ -174,7 +208,42 @@ impl KubeContextModel {
         event: &BulkFilesystemWatcherEvent,
         ctx: &mut ModelContext<Self>,
     ) {
-        for key in affected_keys(self.entries.keys(), event) {
+        let mut changed: HashSet<KubeconfigKey> = affected_keys(
+            self.entries
+                .iter()
+                .map(|(key, entry)| (key, entry.watch_paths.as_slice())),
+            event,
+        )
+        .into_iter()
+        .collect();
+
+        let created: Vec<PathBuf> = self
+            .pending_dirs
+            .iter()
+            .filter(|dir| dir.is_dir())
+            .cloned()
+            .collect();
+        for dir in &created {
+            self.pending_dirs.remove(dir);
+        }
+        changed.extend(
+            self.entries
+                .iter()
+                .filter(|(_, entry)| {
+                    entry
+                        .watch_paths
+                        .iter()
+                        .any(|path| created.iter().any(|dir| path.starts_with(dir)))
+                })
+                .map(|(key, _)| key.clone()),
+        );
+
+        for key in changed {
+            let paths = watch_paths(&key);
+            self.watch(&paths, ctx);
+            if let Some(entry) = self.entries.get_mut(&key) {
+                entry.watch_paths = paths;
+            }
             self.fetch(key, ctx);
         }
     }
