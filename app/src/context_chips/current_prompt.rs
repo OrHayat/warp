@@ -1699,16 +1699,33 @@ impl CurrentPrompt {
     /// Returns `false` when the session is not one whose kubeconfig this machine can watch.
     #[cfg(feature = "local_fs")]
     fn sync_local_kube_context(&mut self, ctx: &mut ModelContext<Self>) -> bool {
+        let kind = ContextChipKind::KubernetesContext;
         let Some((key, path_env)) = self.local_kubeconfig(ctx) else {
             self.kube_key = None;
             return false;
         };
+        let Some(chip) = kind.to_chip() else {
+            return false;
+        };
+        // Same `kubectl` check as the shell generator, so sessions without it launch nothing.
+        let availability = self
+            .with_current_generator_context(ctx, |generator_context| {
+                chip.availability(&self.chip_runtime_capabilities_for_session(
+                    generator_context.active_session,
+                    chip.runtime_policy().required_executables(),
+                    false,
+                ))
+            })
+            .unwrap_or(ChipAvailability::Enabled);
+        self.set_chip_availability(&kind, availability.clone());
+        if !availability.is_enabled() {
+            self.kube_key = None;
+            self.update_chip_value(&kind, None);
+            self.set_chip_update_status(&kind, ChipUpdateStatus::Disabled);
+            return true;
+        }
         KubeContextModel::handle(ctx).update(ctx, |model, ctx| model.ensure(&key, path_env, ctx));
         self.kube_key = Some(key);
-        self.set_chip_availability(
-            &ContextChipKind::KubernetesContext,
-            ChipAvailability::Enabled,
-        );
         self.apply_kube_context(ctx);
         true
     }

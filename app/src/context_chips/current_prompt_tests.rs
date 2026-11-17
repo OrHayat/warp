@@ -1240,3 +1240,92 @@ fn test_kubernetes_chip_fingerprint_follows_kubeconfig_env() {
         });
     });
 }
+
+#[cfg(feature = "local_fs")]
+#[test]
+fn test_local_kubernetes_chip_without_kubectl_launches_nothing() {
+    use crate::context_chips::kube_context::KubeContextModel;
+    use crate::terminal::model::session::{BootstrapSessionType, get_local_hostname};
+
+    App::test((), |mut app| async move {
+        let session_id = SessionId::from(654);
+        app.add_singleton_model(|_| {
+            Prompt::mock_with(
+                [ContextChipKind::KubernetesContext],
+                false,
+                WarpPromptSeparator::None,
+            )
+        });
+        app.add_singleton_model(SessionSettings::new_with_defaults);
+        app.add_singleton_model(|_| History::new(vec![]));
+        app.add_singleton_model(|_ctx| {
+            settings::PublicPreferences::new(
+                Box::<user_preferences::in_memory::InMemoryPreferences>::default(),
+            )
+        });
+        app.add_singleton_model(|_| {
+            settings::PrivatePreferences::new(
+                Box::<user_preferences::in_memory::InMemoryPreferences>::default(),
+            )
+        });
+        app.add_singleton_model(|_| ServerApiProvider::new_for_test());
+        app.add_singleton_model(|_| AuthStateProvider::new_for_test());
+        app.add_singleton_model(AppTelemetryContextProvider::new_context_provider);
+        app.add_singleton_model(AuthManager::new_for_test);
+        app.add_singleton_model(|_| crate::settings::manager::SettingsManager::default());
+        crate::settings::InputSettings::register(&mut app);
+        app.update(crate::settings::AISettings::register_and_subscribe_to_events);
+        app.add_singleton_model(crate::workspaces::user_workspaces::UserWorkspaces::default_mock);
+        app.add_singleton_model(KubeContextModel::new_for_test);
+
+        // A local session whose command list has no `kubectl`.
+        let executor = Arc::new(RecordingCommandExecutor::default());
+        let home = dirs::home_dir().expect("home dir");
+        let sessions = app.add_model(|ctx| {
+            let mut sessions = Sessions::new_for_test().with_command_executor(executor.clone());
+            sessions.initialize_bootstrapped_session(
+                SessionInfo::new_for_test()
+                    .with_id(session_id)
+                    .with_session_type(BootstrapSessionType::Local)
+                    .with_hostname(get_local_hostname().expect("local hostname"))
+                    .with_home_dir(home.to_string_lossy().into_owned()),
+                "test command".to_string(),
+                vec![],
+                None,
+                ctx,
+            );
+            sessions
+        });
+        let sessions_for_prompt = sessions.clone();
+        let current_prompt =
+            app.add_model(move |ctx| CurrentPrompt::new(sessions_for_prompt.clone(), ctx));
+        let session = app
+            .read(|ctx| sessions.as_ref(ctx).get(session_id))
+            .expect("session should exist");
+        session.load_external_commands().await;
+        executor.clear();
+
+        current_prompt.update(&mut app, |current_prompt, ctx| {
+            current_prompt.latest_context = Some(PromptContext {
+                active_block_metadata: BlockMetadata::new(Some(session_id), None),
+                environment: Environment::default(),
+            });
+            current_prompt.update_states_with_new_context(ctx);
+
+            let state = current_prompt
+                .states
+                .get(&ContextChipKind::KubernetesContext)
+                .expect("expected kubernetes state");
+            assert_eq!(
+                state.availability,
+                ChipAvailability::Disabled(ChipDisabledReason::RequiresExecutable {
+                    command: "kubectl".to_string(),
+                })
+            );
+            assert!(current_prompt.kube_key.is_none());
+            // The session qualifies for the shared value, so this exercised the local path.
+            assert!(current_prompt.local_kubeconfig(ctx).is_some());
+        });
+        assert!(executor.commands.lock().is_empty());
+    });
+}
